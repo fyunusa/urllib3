@@ -185,6 +185,15 @@ _tls_version_to_st: Dict[int, int] = {
 
 
 def inject_into_urllib3() -> None:
+    
+    warnings.warn(
+        "'urllib3.contrib.securetransport.inject_into_urllib3()' is deprecated and will be removed "
+        "in a future release of urllib3 2.x. Read more in the doc: "
+        "https://urllib3.readthedocs.io/en/stable/reference/contrib/securetransport.html",
+        category=DeprecationWarning,
+        stacklevel=2,
+    )
+    
     """
     Monkey-patch urllib3 with SecureTransport-backed SSL-support.
     """
