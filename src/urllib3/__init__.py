@@ -2,16 +2,18 @@
 Python HTTP library with thread-safe connection pooling, file post support, user friendly, and more
 """
 
+from __future__ import annotations
+
 # Set default logging handler to avoid "No handler found" warnings.
 import logging
+import typing
 import warnings
 from logging import NullHandler
-from typing import Any, Mapping, Optional, TextIO, Type, Union
 
 from . import exceptions
+from ._base_connection import _TYPE_BODY
 from ._collections import HTTPHeaderDict
 from ._version import __version__
-from .connection import _TYPE_BODY
 from .connectionpool import HTTPConnectionPool, HTTPSConnectionPool, connection_from_url
 from .filepost import _TYPE_FIELDS, encode_multipart_formdata
 from .poolmanager import PoolManager, ProxyManager, proxy_from_url
@@ -19,6 +21,26 @@ from .response import BaseHTTPResponse, HTTPResponse
 from .util.request import make_headers
 from .util.retry import Retry
 from .util.timeout import Timeout
+
+# Ensure that Python is compiled with OpenSSL 1.1.1+
+# If the 'ssl' module isn't available at all that's
+# fine, we only care if the module is available.
+try:
+    import ssl
+except ImportError:
+    pass
+else:
+    # fmt: off
+    if (
+        not ssl.OPENSSL_VERSION.startswith("OpenSSL ")
+        or ssl.OPENSSL_VERSION_INFO < (1, 1, 1)
+    ):  # Defensive:
+        raise ImportError(
+            "urllib3 v2.0 only supports OpenSSL 1.1.1+, currently "
+            f"the 'ssl' module is compiled with {ssl.OPENSSL_VERSION}. "
+            "See: https://github.com/urllib3/urllib3/issues/2168"
+        )
+    # fmt: on
 
 # === NOTE TO REPACKAGERS AND VENDORS ===
 # Please delete this block, this logic is only
@@ -31,7 +53,7 @@ except ModuleNotFoundError:
 else:
     warnings.warn(
         "'urllib3[secure]' extra is deprecated and will be removed "
-        "in a future release of urllib3 2.x. Read more in this issue: "
+        "in urllib3 v2.1.0. Read more in this issue: "
         "https://github.com/urllib3/urllib3/issues/2680",
         category=DeprecationWarning,
         stacklevel=2,
@@ -62,7 +84,9 @@ __all__ = (
 logging.getLogger(__name__).addHandler(NullHandler())
 
 
-def add_stderr_logger(level: int = logging.DEBUG) -> "logging.StreamHandler[TextIO]":
+def add_stderr_logger(
+    level: int = logging.DEBUG,
+) -> logging.StreamHandler[typing.TextIO]:
     """
     Helper for quickly adding a StreamHandler to the logger. Useful for
     debugging.
@@ -91,11 +115,9 @@ del NullHandler
 warnings.simplefilter("always", exceptions.SecurityWarning, append=True)
 # InsecurePlatformWarning's don't vary between requests, so we keep it default.
 warnings.simplefilter("default", exceptions.InsecurePlatformWarning, append=True)
-# SNIMissingWarnings should go off only once.
-warnings.simplefilter("default", exceptions.SNIMissingWarning, append=True)
 
 
-def disable_warnings(category: Type[Warning] = exceptions.HTTPWarning) -> None:
+def disable_warnings(category: type[Warning] = exceptions.HTTPWarning) -> None:
     """
     Helper for quickly disabling all urllib3 warnings.
     """
@@ -109,15 +131,15 @@ def request(
     method: str,
     url: str,
     *,
-    body: Optional[_TYPE_BODY] = None,
-    fields: Optional[_TYPE_FIELDS] = None,
-    headers: Optional[Mapping[str, str]] = None,
-    preload_content: Optional[bool] = True,
-    decode_content: Optional[bool] = True,
-    redirect: Optional[bool] = True,
-    retries: Optional[Union[Retry, bool, int]] = None,
-    timeout: Optional[Union[Timeout, float, int]] = 3,
-    json: Optional[Any] = None,
+    body: _TYPE_BODY | None = None,
+    fields: _TYPE_FIELDS | None = None,
+    headers: typing.Mapping[str, str] | None = None,
+    preload_content: bool | None = True,
+    decode_content: bool | None = True,
+    redirect: bool | None = True,
+    retries: Retry | bool | int | None = None,
+    timeout: Timeout | float | int | None = 3,
+    json: typing.Any | None = None,
 ) -> BaseHTTPResponse:
     """
     A convenience, top-level request method. It uses a module-global ``PoolManager`` instance.

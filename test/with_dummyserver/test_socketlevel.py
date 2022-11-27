@@ -1,5 +1,7 @@
 # TODO: Break this module up into pieces. Maybe group by functionality tested
 # rather than the socket level-ness of it.
+from __future__ import annotations
+
 import errno
 import io
 import os
@@ -11,6 +13,7 @@ import ssl
 import sys
 import tempfile
 import time
+import typing
 from collections import OrderedDict
 from pathlib import Path
 from test import (
@@ -22,9 +25,6 @@ from test import (
     resolvesLocalhostFQDN,
 )
 from threading import Event
-from typing import Any, Callable, Generator, List, Optional
-from typing import OrderedDict as OrderedDictType
-from typing import Tuple, Union
 from unittest import mock
 
 import pytest
@@ -40,6 +40,7 @@ from dummyserver.testcase import SocketDummyServerTestCase, consume_socket
 from urllib3 import HTTPConnectionPool, HTTPSConnectionPool, ProxyManager, util
 from urllib3._collections import HTTPHeaderDict
 from urllib3.connection import HTTPConnection, _get_default_user_agent
+from urllib3.connectionpool import _url_from_pool
 from urllib3.exceptions import (
     MaxRetryError,
     ProtocolError,
@@ -53,6 +54,11 @@ from urllib3.util.retry import Retry
 from urllib3.util.timeout import Timeout
 
 from .. import LogRecorder, has_alpn
+
+if typing.TYPE_CHECKING:
+    from _typeshed import StrOrBytesPath
+else:
+    StrOrBytesPath = object
 
 # Retry failed tests
 pytestmark = pytest.mark.flaky
@@ -84,8 +90,6 @@ class TestCookies(SocketDummyServerTestCase):
 
 class TestSNI(SocketDummyServerTestCase):
     def test_hostname_in_first_request_packet(self) -> None:
-        if not util.HAS_SNI:
-            pytest.skip("SNI-support not available")
         done_receiving = Event()
         self.buf = b""
 
@@ -138,6 +142,38 @@ class TestALPN(SocketDummyServerTestCase):
                 ), "missing ALPN protocol in SSL handshake"
 
 
+def original_ssl_wrap_socket(
+    sock: socket.socket,
+    keyfile: StrOrBytesPath | None = None,
+    certfile: StrOrBytesPath | None = None,
+    server_side: bool = False,
+    cert_reqs: ssl.VerifyMode = ssl.CERT_NONE,
+    ssl_version: int = ssl.PROTOCOL_TLS,
+    ca_certs: str | None = None,
+    do_handshake_on_connect: bool = True,
+    suppress_ragged_eofs: bool = True,
+    ciphers: str | None = None,
+) -> ssl.SSLSocket:
+    if server_side and not certfile:
+        raise ValueError("certfile must be specified for server-side operations")
+    if keyfile and not certfile:
+        raise ValueError("certfile must be specified")
+    context = ssl.SSLContext(ssl_version)
+    context.verify_mode = cert_reqs
+    if ca_certs:
+        context.load_verify_locations(ca_certs)
+    if certfile:
+        context.load_cert_chain(certfile, keyfile)
+    if ciphers:
+        context.set_ciphers(ciphers)
+    return context.wrap_socket(
+        sock=sock,
+        server_side=server_side,
+        do_handshake_on_connect=do_handshake_on_connect,
+        suppress_ragged_eofs=suppress_ragged_eofs,
+    )
+
+
 class TestClientCerts(SocketDummyServerTestCase):
     """
     Tests for client certificate support.
@@ -170,7 +206,7 @@ class TestClientCerts(SocketDummyServerTestCase):
         """
         Given a single socket, wraps it in TLS.
         """
-        return ssl.wrap_socket(
+        return original_ssl_wrap_socket(
             sock,
             ssl_version=ssl.PROTOCOL_SSLv23,
             cert_reqs=ssl.CERT_REQUIRED,
@@ -301,7 +337,7 @@ class TestClientCerts(SocketDummyServerTestCase):
     def test_client_cert_with_bytes_password(self) -> None:
         self.run_client_cert_with_password_test(b"letmein")
 
-    def run_client_cert_with_password_test(self, password: Union[bytes, str]) -> None:
+    def run_client_cert_with_password_test(self, password: bytes | str) -> None:
         """
         Tests client certificate password functionality
         """
@@ -1076,7 +1112,7 @@ class TestProxyManager(SocketDummyServerTestCase):
                 return
 
             sock.send(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-            ssl_sock = ssl.wrap_socket(
+            ssl_sock = original_ssl_wrap_socket(
                 sock,
                 server_side=True,
                 keyfile=DEFAULT_CERTS["keyfile"],
@@ -1126,7 +1162,7 @@ class TestProxyManager(SocketDummyServerTestCase):
 
             if s.startswith(f"CONNECT [{ipv6_addr}]:443"):
                 sock.send(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                ssl_sock = ssl.wrap_socket(
+                ssl_sock = original_ssl_wrap_socket(
                     sock,
                     server_side=True,
                     keyfile=DEFAULT_CERTS["keyfile"],
@@ -1193,13 +1229,16 @@ class TestSSL(SocketDummyServerTestCase):
         def socket_handler(listener: socket.socket) -> None:
             sock = listener.accept()[0]
             sock2 = sock.dup()
-            ssl_sock = ssl.wrap_socket(
-                sock,
-                server_side=True,
-                keyfile=DEFAULT_CERTS["keyfile"],
-                certfile=DEFAULT_CERTS["certfile"],
-                ca_certs=DEFAULT_CA,
-            )
+            try:
+                ssl_sock = original_ssl_wrap_socket(
+                    sock,
+                    server_side=True,
+                    keyfile=DEFAULT_CERTS["keyfile"],
+                    certfile=DEFAULT_CERTS["certfile"],
+                    ca_certs=DEFAULT_CA,
+                )
+            except ssl.SSLError:
+                return
 
             buf = b""
             while not buf.endswith(b"\r\n\r\n"):
@@ -1228,7 +1267,7 @@ class TestSSL(SocketDummyServerTestCase):
 
         def socket_handler(listener: socket.socket) -> None:
             sock = listener.accept()[0]
-            ssl_sock = ssl.wrap_socket(
+            ssl_sock = original_ssl_wrap_socket(
                 sock,
                 server_side=True,
                 keyfile=DEFAULT_CERTS["keyfile"],
@@ -1267,13 +1306,18 @@ class TestSSL(SocketDummyServerTestCase):
         def socket_handler(listener: socket.socket) -> None:
             for i in range(2):
                 sock = listener.accept()[0]
-                ssl_sock = ssl.wrap_socket(
-                    sock,
-                    server_side=True,
-                    keyfile=DEFAULT_CERTS["keyfile"],
-                    certfile=DEFAULT_CERTS["certfile"],
-                    ca_certs=DEFAULT_CA,
-                )
+                try:
+                    ssl_sock = original_ssl_wrap_socket(
+                        sock,
+                        server_side=True,
+                        keyfile=DEFAULT_CERTS["keyfile"],
+                        certfile=DEFAULT_CERTS["certfile"],
+                        ca_certs=DEFAULT_CA,
+                    )
+                except (ssl.SSLError, ConnectionResetError):
+                    if i == 1:
+                        raise
+                    return
 
                 ssl_sock.send(
                     b"HTTP/1.1 200 OK\r\n"
@@ -1314,7 +1358,7 @@ class TestSSL(SocketDummyServerTestCase):
             # first request, trigger an SSLError
             sock = listener.accept()[0]
             sock2 = sock.dup()
-            ssl_sock = ssl.wrap_socket(
+            ssl_sock = original_ssl_wrap_socket(
                 sock,
                 server_side=True,
                 keyfile=DEFAULT_CERTS["keyfile"],
@@ -1337,7 +1381,7 @@ class TestSSL(SocketDummyServerTestCase):
 
             # retried request
             sock = listener.accept()[0]
-            ssl_sock = ssl.wrap_socket(
+            ssl_sock = original_ssl_wrap_socket(
                 sock,
                 server_side=True,
                 keyfile=DEFAULT_CERTS["keyfile"],
@@ -1363,13 +1407,16 @@ class TestSSL(SocketDummyServerTestCase):
     def test_ssl_load_default_certs_when_empty(self) -> None:
         def socket_handler(listener: socket.socket) -> None:
             sock = listener.accept()[0]
-            ssl_sock = ssl.wrap_socket(
-                sock,
-                server_side=True,
-                keyfile=DEFAULT_CERTS["keyfile"],
-                certfile=DEFAULT_CERTS["certfile"],
-                ca_certs=DEFAULT_CA,
-            )
+            try:
+                ssl_sock = original_ssl_wrap_socket(
+                    sock,
+                    server_side=True,
+                    keyfile=DEFAULT_CERTS["keyfile"],
+                    certfile=DEFAULT_CERTS["certfile"],
+                    ca_certs=DEFAULT_CA,
+                )
+            except (ssl.SSLError, OSError):
+                return
 
             buf = b""
             while not buf.endswith(b"\r\n\r\n"):
@@ -1402,13 +1449,16 @@ class TestSSL(SocketDummyServerTestCase):
     def test_ssl_dont_load_default_certs_when_given(self) -> None:
         def socket_handler(listener: socket.socket) -> None:
             sock = listener.accept()[0]
-            ssl_sock = ssl.wrap_socket(
-                sock,
-                server_side=True,
-                keyfile=DEFAULT_CERTS["keyfile"],
-                certfile=DEFAULT_CERTS["certfile"],
-                ca_certs=DEFAULT_CA,
-            )
+            try:
+                ssl_sock = original_ssl_wrap_socket(
+                    sock,
+                    server_side=True,
+                    keyfile=DEFAULT_CERTS["keyfile"],
+                    certfile=DEFAULT_CERTS["certfile"],
+                    ca_certs=DEFAULT_CA,
+                )
+            except (ssl.SSLError, OSError):
+                return
 
             buf = b""
             while not buf.endswith(b"\r\n\r\n"):
@@ -1466,13 +1516,15 @@ class TestSSL(SocketDummyServerTestCase):
         def socket_handler(listener: socket.socket) -> None:
             sock = listener.accept()[0]
             try:
-                _ = ssl.wrap_socket(
+                _ = original_ssl_wrap_socket(
                     sock,
                     server_side=True,
                     keyfile=DEFAULT_CERTS["keyfile"],
                     certfile=DEFAULT_CERTS["certfile"],
                     ca_certs=DEFAULT_CA,
                 )
+            except ConnectionResetError:
+                return
             except ssl.SSLError as e:
                 assert "alert unknown ca" in str(e)
                 if is_closed_socket(sock):
@@ -1503,7 +1555,7 @@ class TestSSL(SocketDummyServerTestCase):
         "preload_content,read_amt", [(True, None), (False, None), (False, 2**31)]
     )
     def test_requesting_large_resources_via_ssl(
-        self, preload_content: bool, read_amt: Optional[int]
+        self, preload_content: bool, read_amt: int | None
     ) -> None:
         """
         Ensure that it is possible to read 2 GiB or more via an SSL
@@ -1515,7 +1567,7 @@ class TestSSL(SocketDummyServerTestCase):
 
         def socket_handler(listener: socket.socket) -> None:
             sock = listener.accept()[0]
-            ssl_sock = ssl.wrap_socket(
+            ssl_sock = original_ssl_wrap_socket(
                 sock,
                 server_side=True,
                 keyfile=DEFAULT_CERTS["keyfile"],
@@ -1582,8 +1634,8 @@ class TestHeaders(SocketDummyServerTestCase):
             assert HEADERS == dict(r.headers.items())  # to preserve case sensitivity
 
     def start_parsing_handler(self) -> None:
-        self.parsed_headers: OrderedDictType[str, str] = OrderedDict()
-        self.received_headers: List[bytes] = []
+        self.parsed_headers: typing.OrderedDict[str, str] = OrderedDict()
+        self.received_headers: list[bytes] = []
 
         def socket_handler(listener: socket.socket) -> None:
             sock = listener.accept()[0]
@@ -1645,7 +1697,9 @@ class TestHeaders(SocketDummyServerTestCase):
             (f"X-Header-{int(i)}", str(i)) for i in reversed(range(K))
         ]
 
-        def filter_non_x_headers(d: OrderedDictType[str, str]) -> List[Tuple[str, str]]:
+        def filter_non_x_headers(
+            d: typing.OrderedDict[str, str]
+        ) -> list[tuple[str, str]]:
             return [(k, v) for (k, v) in d.items() if k.startswith("X-Header-")]
 
         self.start_parsing_handler()
@@ -1711,13 +1765,13 @@ class TestHeaders(SocketDummyServerTestCase):
         ],
     )
     def test_headers_sent_with_add(
-        self, method_type: str, body_type: Optional[str]
+        self, method_type: str, body_type: str | None
     ) -> None:
         """
         Confirm that when adding headers with combine=True that we simply append to the
         most recent value, rather than create a new header line.
         """
-        body: Union[None, bytes, io.BytesIO]
+        body: None | bytes | io.BytesIO
         if body_type is None:
             body = None
         elif body_type == "bytes":
@@ -1773,7 +1827,7 @@ class TestHeaders(SocketDummyServerTestCase):
 
 class TestBrokenHeaders(SocketDummyServerTestCase):
     def _test_broken_header_parsing(
-        self, headers: List[bytes], unparsed_data_check: Optional[str] = None
+        self, headers: list[bytes], unparsed_data_check: str | None = None
     ) -> None:
         self.start_response_handler(
             (
@@ -1793,7 +1847,7 @@ class TestBrokenHeaders(SocketDummyServerTestCase):
                 if (
                     "Failed to parse headers" in record.msg
                     and isinstance(record.args, tuple)
-                    and pool._absolute_url("/") == record.args[0]
+                    and _url_from_pool(pool, "/") == record.args[0]
                 ):
                     if (
                         unparsed_data_check is None
@@ -1921,15 +1975,8 @@ class TestBadContentLength(SocketDummyServerTestCase):
                 "GET", url="/", preload_content=False, enforce_content_length=True
             )
             data = get_response.stream(100)
-            # Read "good" data before we try to read again.
-            # This won't trigger till generator is exhausted.
-            next(data)
-            try:
+            with pytest.raises(ProtocolError, match="12 bytes read, 10 more expected"):
                 next(data)
-                assert False
-            except ProtocolError as e:
-                assert "12 bytes read, 10 more expected" in str(e)
-
             done_event.set()
 
     def test_enforce_content_length_no_body(self) -> None:
@@ -2000,7 +2047,7 @@ class TestBrokenPipe(SocketDummyServerTestCase):
         # a buffer that will cause two sendall calls
         buf = "a" * 1024 * 1024 * 4
 
-        def connect_and_wait(*args: Any, **kw: Any) -> None:
+        def connect_and_wait(*args: typing.Any, **kw: typing.Any) -> None:
             ret = orig_connect(*args, **kw)
             assert sock_shut.wait(5)
             return ret
@@ -2074,7 +2121,7 @@ class TestContentFraming(SocketDummyServerTestCase):
     @pytest.mark.parametrize("content_length", [None, 0])
     @pytest.mark.parametrize("method", ["POST", "PUT", "PATCH"])
     def test_content_length_0_by_default(
-        self, method: str, content_length: Optional[int]
+        self, method: str, content_length: int | None
     ) -> None:
         buffer = bytearray()
 
@@ -2134,10 +2181,10 @@ class TestContentFraming(SocketDummyServerTestCase):
 
         self._start_server(socket_handler)
 
-        body: Any
+        body: typing.Any
         if body_type == "generator":
 
-            def body_generator() -> Generator[bytes, None, None]:
+            def body_generator() -> typing.Generator[bytes, None, None]:
                 yield b"x" * 10
 
             body = body_generator()
@@ -2192,10 +2239,10 @@ class TestContentFraming(SocketDummyServerTestCase):
 
         self._start_server(socket_handler)
 
-        body: Any
+        body: typing.Any
         if body_type == "generator":
 
-            def body_generator() -> Generator[bytes, None, None]:
+            def body_generator() -> typing.Generator[bytes, None, None]:
                 yield b"x" * 10
 
             body = body_generator()
@@ -2258,7 +2305,7 @@ class TestContentFraming(SocketDummyServerTestCase):
     )
     def test_framing_set_via_headers(
         self,
-        header_transform: Callable[[str], str],
+        header_transform: typing.Callable[[str], str],
         header: str,
         header_value: str,
         expected: bytes,

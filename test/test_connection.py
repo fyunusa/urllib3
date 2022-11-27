@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import datetime
 import socket
 import typing
+from http.client import ResponseNotReady
 from unittest import mock
 
 import pytest
@@ -8,8 +11,10 @@ import pytest
 from urllib3.connection import (  # type: ignore[attr-defined]
     RECENT_DATE,
     CertificateError,
+    HTTPConnection,
     HTTPSConnection,
     _match_hostname,
+    _url_from_connection,
     _wrap_proxy_error,
 )
 from urllib3.exceptions import HTTPError, ProxyError
@@ -34,18 +39,18 @@ class TestConnection:
             _match_hostname(cert, asserted_hostname)
 
     def test_match_hostname_empty_cert(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {}
+        cert: _TYPE_PEER_CERT_RET_DICT = {}
         asserted_hostname = "foo"
         with pytest.raises(ValueError):
             _match_hostname(cert, asserted_hostname)
 
     def test_match_hostname_match(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {"subjectAltName": (("DNS", "foo"),)}
+        cert: _TYPE_PEER_CERT_RET_DICT = {"subjectAltName": (("DNS", "foo"),)}
         asserted_hostname = "foo"
         _match_hostname(cert, asserted_hostname)
 
     def test_match_hostname_mismatch(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {"subjectAltName": (("DNS", "foo"),)}
+        cert: _TYPE_PEER_CERT_RET_DICT = {"subjectAltName": (("DNS", "foo"),)}
         asserted_hostname = "bar"
         try:
             with mock.patch("urllib3.connection.log.warning") as mock_log:
@@ -60,7 +65,7 @@ class TestConnection:
             assert e._peer_cert == cert
 
     def test_match_hostname_no_dns(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {"subjectAltName": (("DNS", ""),)}
+        cert: _TYPE_PEER_CERT_RET_DICT = {"subjectAltName": (("DNS", ""),)}
         asserted_hostname = "bar"
         try:
             with mock.patch("urllib3.connection.log.warning") as mock_log:
@@ -75,24 +80,24 @@ class TestConnection:
             assert e._peer_cert == cert
 
     def test_match_hostname_startwith_wildcard(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {"subjectAltName": (("DNS", "*"),)}
+        cert: _TYPE_PEER_CERT_RET_DICT = {"subjectAltName": (("DNS", "*"),)}
         asserted_hostname = "foo"
         _match_hostname(cert, asserted_hostname)
 
     def test_match_hostname_dnsname(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {
+        cert: _TYPE_PEER_CERT_RET_DICT = {
             "subjectAltName": (("DNS", "xn--p1b6ci4b4b3a*.xn--11b5bs8d"),)
         }
         asserted_hostname = "xn--p1b6ci4b4b3a*.xn--11b5bs8d"
         _match_hostname(cert, asserted_hostname)
 
     def test_match_hostname_include_wildcard(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {"subjectAltName": (("DNS", "foo*"),)}
+        cert: _TYPE_PEER_CERT_RET_DICT = {"subjectAltName": (("DNS", "foo*"),)}
         asserted_hostname = "foobar"
         _match_hostname(cert, asserted_hostname)
 
     def test_match_hostname_more_than_one_dnsname_error(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {
+        cert: _TYPE_PEER_CERT_RET_DICT = {
             "subjectAltName": (("DNS", "foo*"), ("DNS", "fo*"))
         }
         asserted_hostname = "bar"
@@ -104,7 +109,7 @@ class TestConnection:
             _dnsname_match("foo**", "foobar")
 
     def test_match_hostname_ignore_common_name(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {"subject": ((("commonName", "foo"),),)}
+        cert: _TYPE_PEER_CERT_RET_DICT = {"subject": ((("commonName", "foo"),),)}
         asserted_hostname = "foo"
         with pytest.raises(
             ImplementationCertificateError,
@@ -113,12 +118,12 @@ class TestConnection:
             match_hostname(cert, asserted_hostname)
 
     def test_match_hostname_check_common_name(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {"subject": ((("commonName", "foo"),),)}
+        cert: _TYPE_PEER_CERT_RET_DICT = {"subject": ((("commonName", "foo"),),)}
         asserted_hostname = "foo"
         match_hostname(cert, asserted_hostname, True)
 
     def test_match_hostname_ip_address(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {
+        cert: _TYPE_PEER_CERT_RET_DICT = {
             "subjectAltName": (("IP Address", "1.1.1.1"),)
         }
         asserted_hostname = "1.1.1.2"
@@ -148,11 +153,11 @@ class TestConnection:
         self, asserted_hostname: str, san_ip: str
     ) -> None:
         """Check that hostname matches follow RFC 9110 rules for IPv6."""
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {"subjectAltName": (("IP Address", san_ip),)}
+        cert: _TYPE_PEER_CERT_RET_DICT = {"subjectAltName": (("IP Address", san_ip),)}
         match_hostname(cert, asserted_hostname)
 
     def test_match_hostname_ip_address_ipv6_doesnt_match(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {
+        cert: _TYPE_PEER_CERT_RET_DICT = {
             "subjectAltName": (("IP Address", "1:2::2:1"),)
         }
         asserted_hostname = "1:2::2:2"
@@ -169,7 +174,7 @@ class TestConnection:
             assert e._peer_cert == cert
 
     def test_match_hostname_dns_with_brackets_doesnt_match(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {
+        cert: _TYPE_PEER_CERT_RET_DICT = {
             "subjectAltName": (
                 ("DNS", "localhost"),
                 ("IP Address", "localhost"),
@@ -184,7 +189,7 @@ class TestConnection:
         )
 
     def test_match_hostname_ip_address_ipv6_brackets(self) -> None:
-        cert: "_TYPE_PEER_CERT_RET_DICT" = {
+        cert: _TYPE_PEER_CERT_RET_DICT = {
             "subjectAltName": (("IP Address", "1:2::2:1"),)
         }
         asserted_hostname = "[1:2::2:1]"
@@ -217,3 +222,16 @@ class TestConnection:
         new_err = _wrap_proxy_error(HTTPError("unknown protocol"), proxy_scheme)
         assert isinstance(new_err, ProxyError) is True
         assert err_part in new_err.args[0]
+
+    def test_url_from_pool(self) -> None:
+        conn = HTTPConnection("google.com", port=80)
+
+        path = "path?query=foo"
+        assert f"http://google.com:80/{path}" == _url_from_connection(conn, path)
+
+    def test_getresponse_requires_reponseoptions(self) -> None:
+        conn = HTTPConnection("google.com", port=80)
+
+        # Should error if a request has not been sent
+        with pytest.raises(ResponseNotReady):
+            conn.getresponse()

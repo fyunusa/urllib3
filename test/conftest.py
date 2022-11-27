@@ -1,35 +1,26 @@
+from __future__ import annotations
+
+import asyncio
 import contextlib
-import platform
 import socket
 import ssl
-import sys
-import threading
+import typing
 from pathlib import Path
-from typing import AbstractSet, Any, Dict, Generator, NamedTuple, Optional, Tuple
 
 import pytest
 import trustme
-from tornado import ioloop, web
+from tornado import web
 
 from dummyserver.handlers import TestingApp
 from dummyserver.proxy import ProxyHandler
-from dummyserver.server import HAS_IPV6, run_tornado_app
+from dummyserver.server import HAS_IPV6, run_loop_in_thread, run_tornado_app
 from dummyserver.testcase import HTTPSDummyServerTestCase
 from urllib3.util import ssl_
 
 from .tz_stub import stub_timezone_ctx
 
 
-# The Python 3.8+ default loop on Windows breaks Tornado
-@pytest.fixture(scope="session", autouse=True)
-def configure_windows_event_loop() -> None:
-    if sys.version_info >= (3, 8) and platform.system() == "Windows":
-        import asyncio
-
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())  # type: ignore[attr-defined]
-
-
-class ServerConfig(NamedTuple):
+class ServerConfig(typing.NamedTuple):
     scheme: str
     host: str
     port: int
@@ -45,7 +36,7 @@ class ServerConfig(NamedTuple):
 
 def _write_cert_to_dir(
     cert: trustme.LeafCert, tmpdir: Path, file_prefix: str = "server"
-) -> Dict[str, str]:
+) -> dict[str, str]:
     cert_path = str(tmpdir / ("%s.pem" % file_prefix))
     key_path = str(tmpdir / ("%s.key" % file_prefix))
     cert.private_key_pem.write_to_path(key_path)
@@ -57,26 +48,22 @@ def _write_cert_to_dir(
 @contextlib.contextmanager
 def run_server_in_thread(
     scheme: str, host: str, tmpdir: Path, ca: trustme.CA, server_cert: trustme.LeafCert
-) -> Generator[ServerConfig, None, None]:
+) -> typing.Generator[ServerConfig, None, None]:
     ca_cert_path = str(tmpdir / "ca.pem")
-    server_cert_path = str(tmpdir / "server.pem")
-    server_key_path = str(tmpdir / "server.key")
     ca.cert_pem.write_to_path(ca_cert_path)
-    server_cert.private_key_pem.write_to_path(server_key_path)
-    server_cert.cert_chain_pems[0].write_to_path(server_cert_path)
-    server_certs = {"keyfile": server_key_path, "certfile": server_cert_path}
+    server_certs = _write_cert_to_dir(server_cert, tmpdir)
 
-    io_loop = ioloop.IOLoop.current()
-    app = web.Application([(r".*", TestingApp)])
-    server, port = run_tornado_app(app, io_loop, server_certs, scheme, host)
-    server_thread = threading.Thread(target=io_loop.start)
-    server_thread.start()
+    with run_loop_in_thread() as io_loop:
 
-    yield ServerConfig("https", host, port, ca_cert_path)
+        async def run_app() -> int:
+            app = web.Application([(r".*", TestingApp)])
+            server, port = run_tornado_app(app, server_certs, scheme, host)
+            return port
 
-    io_loop.add_callback(server.stop)
-    io_loop.add_callback(io_loop.stop)
-    server_thread.join()
+        port = asyncio.run_coroutine_threadsafe(
+            run_app(), io_loop.asyncio_loop  # type: ignore[attr-defined]
+        ).result()
+        yield ServerConfig("https", host, port, ca_cert_path)
 
 
 @contextlib.contextmanager
@@ -87,38 +74,37 @@ def run_server_and_proxy_in_thread(
     ca: trustme.CA,
     proxy_cert: trustme.LeafCert,
     server_cert: trustme.LeafCert,
-) -> Generator[Tuple[ServerConfig, ServerConfig], None, None]:
+) -> typing.Generator[tuple[ServerConfig, ServerConfig], None, None]:
     ca_cert_path = str(tmpdir / "ca.pem")
     ca.cert_pem.write_to_path(ca_cert_path)
 
     server_certs = _write_cert_to_dir(server_cert, tmpdir)
     proxy_certs = _write_cert_to_dir(proxy_cert, tmpdir, "proxy")
 
-    io_loop = ioloop.IOLoop.current()
-    app = web.Application([(r".*", TestingApp)])
-    server_app, port = run_tornado_app(app, io_loop, server_certs, "https", "localhost")
-    server_config = ServerConfig("https", "localhost", port, ca_cert_path)
+    with run_loop_in_thread() as io_loop:
 
-    proxy = web.Application([(r".*", ProxyHandler)])
-    proxy_app, proxy_port = run_tornado_app(
-        proxy, io_loop, proxy_certs, proxy_scheme, proxy_host
-    )
-    proxy_config = ServerConfig(proxy_scheme, proxy_host, proxy_port, ca_cert_path)
+        async def run_app() -> tuple[ServerConfig, ServerConfig]:
+            app = web.Application([(r".*", TestingApp)])
+            server_app, port = run_tornado_app(app, server_certs, "https", "localhost")
+            server_config = ServerConfig("https", "localhost", port, ca_cert_path)
 
-    server_thread = threading.Thread(target=io_loop.start)
-    server_thread.start()
+            proxy = web.Application([(r".*", ProxyHandler)])
+            proxy_app, proxy_port = run_tornado_app(
+                proxy, proxy_certs, proxy_scheme, proxy_host
+            )
+            proxy_config = ServerConfig(
+                proxy_scheme, proxy_host, proxy_port, ca_cert_path
+            )
+            return proxy_config, server_config
 
-    yield (proxy_config, server_config)
-
-    io_loop.add_callback(server_app.stop)
-    io_loop.add_callback(proxy_app.stop)
-    io_loop.add_callback(io_loop.stop)
-
-    server_thread.join()
+        proxy_config, server_config = asyncio.run_coroutine_threadsafe(
+            run_app(), io_loop.asyncio_loop  # type: ignore[attr-defined]
+        ).result()
+        yield (proxy_config, server_config)
 
 
 @pytest.fixture(params=["localhost", "127.0.0.1", "::1"])
-def loopback_host(request: Any) -> Generator[str, None, None]:
+def loopback_host(request: typing.Any) -> typing.Generator[str, None, None]:
     host = request.param
     if host == "::1" and not HAS_IPV6:
         pytest.skip("Test requires IPv6 on loopback")
@@ -128,7 +114,7 @@ def loopback_host(request: Any) -> Generator[str, None, None]:
 @pytest.fixture()
 def san_server(
     loopback_host: str, tmp_path_factory: pytest.TempPathFactory
-) -> Generator[ServerConfig, None, None]:
+) -> typing.Generator[ServerConfig, None, None]:
     tmpdir = tmp_path_factory.mktemp("certs")
     ca = trustme.CA()
 
@@ -141,7 +127,7 @@ def san_server(
 @pytest.fixture()
 def no_san_server(
     loopback_host: str, tmp_path_factory: pytest.TempPathFactory
-) -> Generator[ServerConfig, None, None]:
+) -> typing.Generator[ServerConfig, None, None]:
     tmpdir = tmp_path_factory.mktemp("certs")
     ca = trustme.CA()
     server_cert = ca.issue_cert(common_name=loopback_host)
@@ -153,7 +139,7 @@ def no_san_server(
 @pytest.fixture()
 def no_san_server_with_different_commmon_name(
     tmp_path_factory: pytest.TempPathFactory,
-) -> Generator[ServerConfig, None, None]:
+) -> typing.Generator[ServerConfig, None, None]:
     tmpdir = tmp_path_factory.mktemp("certs")
     ca = trustme.CA()
     server_cert = ca.issue_cert(common_name="example.com")
@@ -163,9 +149,24 @@ def no_san_server_with_different_commmon_name(
 
 
 @pytest.fixture
+def san_proxy_with_server(
+    loopback_host: str, tmp_path_factory: pytest.TempPathFactory
+) -> typing.Generator[tuple[ServerConfig, ServerConfig], None, None]:
+    tmpdir = tmp_path_factory.mktemp("certs")
+    ca = trustme.CA()
+    proxy_cert = ca.issue_cert(loopback_host)
+    server_cert = ca.issue_cert("localhost")
+
+    with run_server_and_proxy_in_thread(
+        "https", loopback_host, tmpdir, ca, proxy_cert, server_cert
+    ) as cfg:
+        yield cfg
+
+
+@pytest.fixture
 def no_san_proxy_with_server(
     tmp_path_factory: pytest.TempPathFactory,
-) -> Generator[Tuple[ServerConfig, ServerConfig], None, None]:
+) -> typing.Generator[tuple[ServerConfig, ServerConfig], None, None]:
     tmpdir = tmp_path_factory.mktemp("certs")
     ca = trustme.CA()
     # only common name, no subject alternative names
@@ -181,7 +182,7 @@ def no_san_proxy_with_server(
 @pytest.fixture
 def no_localhost_san_server(
     tmp_path_factory: pytest.TempPathFactory,
-) -> Generator[ServerConfig, None, None]:
+) -> typing.Generator[ServerConfig, None, None]:
     tmpdir = tmp_path_factory.mktemp("certs")
     ca = trustme.CA()
     # non localhost common name
@@ -194,7 +195,7 @@ def no_localhost_san_server(
 @pytest.fixture
 def ipv4_san_proxy_with_server(
     tmp_path_factory: pytest.TempPathFactory,
-) -> Generator[Tuple[ServerConfig, ServerConfig], None, None]:
+) -> typing.Generator[tuple[ServerConfig, ServerConfig], None, None]:
     tmpdir = tmp_path_factory.mktemp("certs")
     ca = trustme.CA()
     # IP address in Subject Alternative Name
@@ -211,7 +212,7 @@ def ipv4_san_proxy_with_server(
 @pytest.fixture
 def ipv6_san_proxy_with_server(
     tmp_path_factory: pytest.TempPathFactory,
-) -> Generator[Tuple[ServerConfig, ServerConfig], None, None]:
+) -> typing.Generator[tuple[ServerConfig, ServerConfig], None, None]:
     tmpdir = tmp_path_factory.mktemp("certs")
     ca = trustme.CA()
     # IP addresses in Subject Alternative Name
@@ -228,7 +229,7 @@ def ipv6_san_proxy_with_server(
 @pytest.fixture
 def ipv4_san_server(
     tmp_path_factory: pytest.TempPathFactory,
-) -> Generator[ServerConfig, None, None]:
+) -> typing.Generator[ServerConfig, None, None]:
     tmpdir = tmp_path_factory.mktemp("certs")
     ca = trustme.CA()
     # IP address in Subject Alternative Name
@@ -241,7 +242,7 @@ def ipv4_san_server(
 @pytest.fixture
 def ipv6_san_server(
     tmp_path_factory: pytest.TempPathFactory,
-) -> Generator[ServerConfig, None, None]:
+) -> typing.Generator[ServerConfig, None, None]:
     if not HAS_IPV6:
         pytest.skip("Only runs on IPv6 systems")
 
@@ -257,7 +258,7 @@ def ipv6_san_server(
 @pytest.fixture
 def ipv6_no_san_server(
     tmp_path_factory: pytest.TempPathFactory,
-) -> Generator[ServerConfig, None, None]:
+) -> typing.Generator[ServerConfig, None, None]:
     if not HAS_IPV6:
         pytest.skip("Only runs on IPv6 systems")
 
@@ -271,16 +272,16 @@ def ipv6_no_san_server(
 
 
 @pytest.fixture
-def stub_timezone(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+def stub_timezone(request: pytest.FixtureRequest) -> typing.Generator[None, None, None]:
     """
     A pytest fixture that runs the test with a stub timezone.
     """
-    with stub_timezone_ctx(request.param):  # type: ignore[attr-defined]
+    with stub_timezone_ctx(request.param):
         yield
 
 
 @pytest.fixture(scope="session")
-def supported_tls_versions() -> AbstractSet[Optional[str]]:
+def supported_tls_versions() -> typing.AbstractSet[str | None]:
     # We have to create an actual TLS connection
     # to test if the TLS version is not disabled by
     # OpenSSL config. Ubuntu 20.04 specifically
@@ -313,28 +314,28 @@ def supported_tls_versions() -> AbstractSet[Optional[str]]:
 
 
 @pytest.fixture(scope="function")
-def requires_tlsv1(supported_tls_versions: AbstractSet[str]) -> None:
+def requires_tlsv1(supported_tls_versions: typing.AbstractSet[str]) -> None:
     """Test requires TLSv1 available"""
     if not hasattr(ssl, "PROTOCOL_TLSv1") or "TLSv1" not in supported_tls_versions:
         pytest.skip("Test requires TLSv1")
 
 
 @pytest.fixture(scope="function")
-def requires_tlsv1_1(supported_tls_versions: AbstractSet[str]) -> None:
+def requires_tlsv1_1(supported_tls_versions: typing.AbstractSet[str]) -> None:
     """Test requires TLSv1.1 available"""
     if not hasattr(ssl, "PROTOCOL_TLSv1_1") or "TLSv1.1" not in supported_tls_versions:
         pytest.skip("Test requires TLSv1.1")
 
 
 @pytest.fixture(scope="function")
-def requires_tlsv1_2(supported_tls_versions: AbstractSet[str]) -> None:
+def requires_tlsv1_2(supported_tls_versions: typing.AbstractSet[str]) -> None:
     """Test requires TLSv1.2 available"""
     if not hasattr(ssl, "PROTOCOL_TLSv1_2") or "TLSv1.2" not in supported_tls_versions:
         pytest.skip("Test requires TLSv1.2")
 
 
 @pytest.fixture(scope="function")
-def requires_tlsv1_3(supported_tls_versions: AbstractSet[str]) -> None:
+def requires_tlsv1_3(supported_tls_versions: typing.AbstractSet[str]) -> None:
     """Test requires TLSv1.3 available"""
     if (
         not getattr(ssl, "HAS_TLSv1_3", False)

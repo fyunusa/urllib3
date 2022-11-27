@@ -1,6 +1,9 @@
+from __future__ import annotations
+
 import os
 import shutil
 import subprocess
+import sys
 
 import nox
 
@@ -31,6 +34,12 @@ def tests_impl(
     # Print OpenSSL information.
     session.run("python", "-m", "OpenSSL.debug")
 
+    memray_supported = True
+    if sys.implementation.name != "cpython" or sys.version_info < (3, 8):
+        memray_supported = False  # pytest-memray requires CPython 3.8+
+    elif sys.platform == "win32":
+        memray_supported = False
+
     # Inspired from https://hynek.me/articles/ditch-codecov-python/
     # We use parallel mode and then combine in a later CI step
     session.run(
@@ -42,11 +51,15 @@ def tests_impl(
         "--parallel-mode",
         "-m",
         "pytest",
-        "-r",
-        "a",
+        *("--memray", "--hide-memray-summary") if memray_supported else (),
+        "-v",
+        "-ra",
         f"--color={'yes' if 'GITHUB_ACTIONS' in os.environ else 'auto'}",
         "--tb=native",
         "--no-success-flaky-report",
+        "--durations=10",
+        "--strict-config",
+        "--strict-markers",
         *(session.posargs or ("test/",)),
         env={"PYTHONWARNINGS": "always::DeprecationWarning"},
     )
@@ -81,7 +94,21 @@ def test_brotlipy(session: nox.Session) -> None:
 
 
 def git_clone(session: nox.Session, git_url: str) -> None:
-    session.run("git", "clone", "--depth", "1", git_url, external=True)
+    """We either clone the target repository or if already exist
+    simply reset the state and pull.
+    """
+    expected_directory = git_url.split("/")[-1]
+
+    if expected_directory.endswith(".git"):
+        expected_directory = expected_directory[:-4]
+
+    if not os.path.isdir(expected_directory):
+        session.run("git", "clone", "--depth", "1", git_url, external=True)
+    else:
+        session.run(
+            "git", "-C", expected_directory, "reset", "--hard", "HEAD", external=True
+        )
+        session.run("git", "-C", expected_directory, "pull", external=True)
 
 
 @nox.session()
@@ -92,12 +119,11 @@ def downstream_botocore(session: nox.Session) -> None:
     session.cd(tmp_dir)
     git_clone(session, "https://github.com/boto/botocore")
     session.chdir("botocore")
-    session.run(
-        "git",
-        "apply",
-        f"{root}/ci/0001-Mark-100-Continue-tests-as-failing.patch",
-        external=True,
-    )
+    for patch in [
+        "0001-Mark-100-Continue-tests-as-failing.patch",
+        "0002-Stop-relying-on-removed-DEFAULT_CIPHERS.patch",
+    ]:
+        session.run("git", "apply", f"{root}/ci/{patch}", external=True)
     session.run("git", "rev-parse", "HEAD", external=True)
     session.run("python", "scripts/ci/install")
 
@@ -117,7 +143,12 @@ def downstream_requests(session: nox.Session) -> None:
     session.cd(tmp_dir)
     git_clone(session, "https://github.com/psf/requests")
     session.chdir("requests")
-    session.run("git", "apply", f"{root}/ci/requests.patch", external=True)
+    session.run(
+        "git", "apply", f"{root}/ci/0003-requests-removed-warnings.patch", external=True
+    )
+    session.run(
+        "git", "apply", f"{root}/ci/0004-requests-chunked-requests.patch", external=True
+    )
     session.run("git", "rev-parse", "HEAD", external=True)
     session.install(".[socks]", silent=False)
     session.install("-r", "requirements-dev.txt", silent=False)
@@ -133,19 +164,6 @@ def downstream_requests(session: nox.Session) -> None:
 @nox.session()
 def format(session: nox.Session) -> None:
     """Run code formatters."""
-    session.install("pre-commit")
-    session.run("pre-commit", "--version")
-
-    process = subprocess.run(
-        ["pre-commit", "run", "--all-files"],
-        env=session.env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    # Ensure that pre-commit itself ran successfully
-    assert process.returncode in (0, 1)
-
     lint(session)
 
 

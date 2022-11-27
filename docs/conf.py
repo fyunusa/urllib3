@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sys
 from datetime import date
@@ -90,8 +92,17 @@ autodoc_typehints = "description"
 nitpicky = True
 # Except for these ones, which we expect to point to unknown targets:
 nitpick_ignore = [
+    ("py:class", "_TYPE_SOCKS_OPTIONS"),
+    ("py:class", "_TYPE_SOCKET_OPTIONS"),
+    ("py:class", "_TYPE_TIMEOUT"),
+    ("py:class", "_TYPE_FIELD_VALUE"),
+    ("py:class", "_TYPE_BODY"),
+    ("py:class", "_HttplibHTTPResponse"),
+    ("py:class", "_HttplibHTTPMessage"),
+    ("py:class", "TracebackType"),
     ("py:class", "Literal"),
     ("py:class", "email.errors.MessageDefect"),
+    ("py:class", "MessageDefect"),
     ("py:class", "http.client.HTTPMessage"),
     ("py:class", "RequestHistory"),
     ("py:class", "SSLTransportType"),
@@ -102,4 +113,5 @@ nitpick_ignore = [
     ("py:class", "urllib3._request_methods.RequestMethods"),
     ("py:class", "urllib3.contrib.socks._TYPE_SOCKS_OPTIONS"),
     ("py:class", "urllib3.util.timeout._TYPE_DEFAULT"),
+    ("py:class", "BaseHTTPConnection"),
 ]

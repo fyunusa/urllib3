@@ -52,6 +52,8 @@ license and by oscrypto's:
     DEALINGS IN THE SOFTWARE.
 """
 
+from __future__ import annotations
+
 import contextlib
 import ctypes
 import errno
@@ -61,21 +63,10 @@ import socket
 import ssl
 import struct
 import threading
+import typing
 import warnings
 import weakref
 from socket import socket as socket_cls
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    BinaryIO,
-    Dict,
-    Generator,
-    List,
-    Optional,
-    TextIO,
-    Union,
-    cast,
-)
 
 from .. import util
 from ._securetransport.bindings import (  # type: ignore[attr-defined]
@@ -94,23 +85,18 @@ from ._securetransport.low_level import (
 
 warnings.warn(
     "'urllib3.contrib.securetransport' module is deprecated and will be removed "
-    "in a future release of urllib3 2.x. Read more in this issue: "
+    "in urllib3 v2.1.0. Read more in this issue: "
     "https://github.com/urllib3/urllib3/issues/2681",
     category=DeprecationWarning,
     stacklevel=2,
 )
 
-if TYPE_CHECKING:
+if typing.TYPE_CHECKING:
     from typing_extensions import Literal
 
 __all__ = ["inject_into_urllib3", "extract_from_urllib3"]
 
-# SNI always works
-HAS_SNI = True
-
-orig_util_HAS_SNI = util.HAS_SNI
 orig_util_SSLContext = util.ssl_.SSLContext
-orig_util_USE_SYSTEM_SSL_CIPHERS = util.ssl_.USE_DEFAULT_SSLCONTEXT_CIPHERS
 
 # This dictionary is used by the read callback to obtain a handle to the
 # calling wrapped socket. This is a pretty silly approach, but for now it'll
@@ -128,9 +114,9 @@ orig_util_USE_SYSTEM_SSL_CIPHERS = util.ssl_.USE_DEFAULT_SSLCONTEXT_CIPHERS
 #
 # This is good: if we had to lock in the callbacks we'd drastically slow down
 # the performance of this code.
-_connection_refs: "weakref.WeakValueDictionary[int, 'WrappedSocket']" = (
-    weakref.WeakValueDictionary()
-)
+_connection_refs: weakref.WeakValueDictionary[
+    int, WrappedSocket
+] = weakref.WeakValueDictionary()
 _connection_ref_lock = threading.Lock()
 
 # Limit writes to 16kB. This is OpenSSL's limit, but we'll cargo-cult it over
@@ -175,7 +161,7 @@ if hasattr(ssl, "PROTOCOL_TLSv1_2"):
     )
 
 
-_tls_version_to_st: Dict[int, int] = {
+_tls_version_to_st: dict[int, int] = {
     ssl.TLSVersion.MINIMUM_SUPPORTED: SecurityConst.kTLSProtocol1,
     ssl.TLSVersion.TLSv1: SecurityConst.kTLSProtocol1,
     ssl.TLSVersion.TLSv1_1: SecurityConst.kTLSProtocol11,
@@ -199,11 +185,8 @@ def inject_into_urllib3() -> None:
     """
     util.SSLContext = SecureTransportContext  # type: ignore[assignment]
     util.ssl_.SSLContext = SecureTransportContext  # type: ignore[assignment]
-    util.HAS_SNI = HAS_SNI
-    util.ssl_.HAS_SNI = HAS_SNI
     util.IS_SECURETRANSPORT = True
     util.ssl_.IS_SECURETRANSPORT = True
-    util.ssl_.USE_DEFAULT_SSLCONTEXT_CIPHERS = True
 
 
 def extract_from_urllib3() -> None:
@@ -212,11 +195,8 @@ def extract_from_urllib3() -> None:
     """
     util.SSLContext = orig_util_SSLContext
     util.ssl_.SSLContext = orig_util_SSLContext
-    util.HAS_SNI = orig_util_HAS_SNI
-    util.ssl_.HAS_SNI = orig_util_HAS_SNI
     util.IS_SECURETRANSPORT = False
     util.ssl_.IS_SECURETRANSPORT = False
-    util.ssl_.USE_DEFAULT_SSLCONTEXT_CIPHERS = orig_util_USE_SYSTEM_SSL_CIPHERS
 
 
 def _read_callback(
@@ -346,9 +326,9 @@ class WrappedSocket:
         self.context = None
         self._io_refs = 0
         self._closed = False
-        self._exception: Optional[Exception] = None
+        self._exception: Exception | None = None
         self._keychain = None
-        self._keychain_dir: Optional[str] = None
+        self._keychain_dir: str | None = None
         self._client_cert_chain = None
 
         # We save off the previously-configured timeout and then set it to
@@ -360,7 +340,7 @@ class WrappedSocket:
         self.socket.settimeout(0)
 
     @contextlib.contextmanager
-    def _raise_on_error(self) -> Generator[None, None, None]:
+    def _raise_on_error(self) -> typing.Generator[None, None, None]:
         """
         A context manager that can be used to wrap calls that do I/O from
         SecureTransport. If any of the I/O callbacks hit an exception, this
@@ -380,7 +360,7 @@ class WrappedSocket:
             self.close()
             raise exception
 
-    def _set_alpn_protocols(self, protocols: Optional[List[bytes]]) -> None:
+    def _set_alpn_protocols(self, protocols: list[bytes] | None) -> None:
         """
         Sets up the ALPN protocols on the context.
         """
@@ -393,7 +373,7 @@ class WrappedSocket:
         finally:
             CoreFoundation.CFRelease(protocols_arr)
 
-    def _custom_validate(self, verify: bool, trust_bundle: Optional[bytes]) -> None:
+    def _custom_validate(self, verify: bool, trust_bundle: bytes | None) -> None:
         """
         Called when we have set custom validation. We do this in two cases:
         first, when cert validation is entirely disabled; and second, when
@@ -472,15 +452,15 @@ class WrappedSocket:
 
     def handshake(
         self,
-        server_hostname: Optional[Union[bytes, str]],
+        server_hostname: bytes | str | None,
         verify: bool,
-        trust_bundle: Optional[bytes],
+        trust_bundle: bytes | None,
         min_version: int,
         max_version: int,
-        client_cert: Optional[str],
-        client_key: Optional[str],
-        client_key_passphrase: Any,
-        alpn_protocols: Optional[List[bytes]],
+        client_cert: str | None,
+        client_key: str | None,
+        client_key_passphrase: typing.Any,
+        alpn_protocols: list[bytes] | None,
     ) -> None:
         """
         Actually performs the TLS handshake. This is run automatically by
@@ -576,10 +556,10 @@ class WrappedSocket:
         buffer = ctypes.create_string_buffer(bufsiz)
         bytes_read = self.recv_into(buffer, bufsiz)
         data = buffer[:bytes_read]
-        return cast(bytes, data)
+        return typing.cast(bytes, data)
 
     def recv_into(
-        self, buffer: "ctypes.Array[ctypes.c_char]", nbytes: Optional[int] = None
+        self, buffer: ctypes.Array[ctypes.c_char], nbytes: int | None = None
     ) -> int:
         # Read short on EOF.
         if self._closed:
@@ -626,7 +606,7 @@ class WrappedSocket:
     def settimeout(self, timeout: float) -> None:
         self._timeout = timeout
 
-    def gettimeout(self) -> Optional[float]:
+    def gettimeout(self) -> float | None:
         return self._timeout
 
     def send(self, data: bytes) -> int:
@@ -675,7 +655,7 @@ class WrappedSocket:
         else:
             self._io_refs -= 1
 
-    def getpeercert(self, binary_form: bool = False) -> Optional[bytes]:
+    def getpeercert(self, binary_form: bool = False) -> bytes | None:
         # Urgh, annoying.
         #
         # Here's how we do this:
@@ -757,13 +737,13 @@ class WrappedSocket:
 
 def makefile(
     self: socket_cls,
-    mode: Union[
-        "Literal['r']", "Literal['w']", "Literal['rw']", "Literal['wr']", "Literal['']"
-    ] = "r",
-    buffering: Optional[int] = None,
-    *args: Any,
-    **kwargs: Any,
-) -> Union[BinaryIO, TextIO]:
+    mode: (
+        Literal["r"] | Literal["w"] | Literal["rw"] | Literal["wr"] | Literal[""]
+    ) = "r",
+    buffering: int | None = None,
+    *args: typing.Any,
+    **kwargs: typing.Any,
+) -> typing.BinaryIO | typing.TextIO:
     # We disable buffering with SecureTransport because it conflicts with
     # the buffering that ST does internally (see issue #1153 for more).
     buffering = 0
@@ -788,14 +768,14 @@ class SecureTransportContext:
 
         self._options = 0
         self._verify = False
-        self._trust_bundle: Optional[bytes] = None
-        self._client_cert: Optional[str] = None
-        self._client_key: Optional[str] = None
+        self._trust_bundle: bytes | None = None
+        self._client_cert: str | None = None
+        self._client_key: str | None = None
         self._client_key_passphrase = None
-        self._alpn_protocols: Optional[List[bytes]] = None
+        self._alpn_protocols: list[bytes] | None = None
 
     @property
-    def check_hostname(self) -> "Literal[True]":
+    def check_hostname(self) -> Literal[True]:
         """
         SecureTransport cannot have its hostname checking disabled. For more,
         see the comment on getpeercert() in this file.
@@ -803,12 +783,11 @@ class SecureTransportContext:
         return True
 
     @check_hostname.setter
-    def check_hostname(self, value: Any) -> None:
+    def check_hostname(self, value: typing.Any) -> None:
         """
         SecureTransport cannot have its hostname checking disabled. For more,
         see the comment on getpeercert() in this file.
         """
-        pass
 
     @property
     def options(self) -> int:
@@ -848,14 +827,14 @@ class SecureTransportContext:
     def load_default_certs(self) -> None:
         return self.set_default_verify_paths()
 
-    def set_ciphers(self, ciphers: Any) -> None:
+    def set_ciphers(self, ciphers: typing.Any) -> None:
         raise ValueError("SecureTransport doesn't support custom cipher strings")
 
     def load_verify_locations(
         self,
-        cafile: Optional[str] = None,
-        capath: Optional[str] = None,
-        cadata: Optional[bytes] = None,
+        cafile: str | None = None,
+        capath: str | None = None,
+        cadata: bytes | None = None,
     ) -> None:
         # OK, we only really support cadata and cafile.
         if capath is not None:
@@ -871,14 +850,14 @@ class SecureTransportContext:
     def load_cert_chain(
         self,
         certfile: str,
-        keyfile: Optional[str] = None,
-        password: Optional[str] = None,
+        keyfile: str | None = None,
+        password: str | None = None,
     ) -> None:
         self._client_cert = certfile
         self._client_key = keyfile
         self._client_cert_passphrase = password
 
-    def set_alpn_protocols(self, protocols: List[Union[str, bytes]]) -> None:
+    def set_alpn_protocols(self, protocols: list[str | bytes]) -> None:
         """
         Sets the ALPN protocols that will later be set on the context.
 
@@ -896,7 +875,7 @@ class SecureTransportContext:
         server_side: bool = False,
         do_handshake_on_connect: bool = True,
         suppress_ragged_eofs: bool = True,
-        server_hostname: Optional[Union[bytes, str]] = None,
+        server_hostname: bytes | str | None = None,
     ) -> WrappedSocket:
         # So, what do we do here? Firstly, we assert some properties. This is a
         # stripped down shim, so there is some functionality we don't support.

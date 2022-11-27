@@ -1,11 +1,16 @@
+from __future__ import annotations
+
+import binascii
+import hashlib
+import ipaddress
 import os.path
+import pathlib
 import shutil
 import socket
 import ssl
 import tempfile
 from test import LONG_TIMEOUT, SHORT_TIMEOUT, onlySecureTransport, withPyOpenSSL
 from test.conftest import ServerConfig
-from typing import Tuple
 
 import pytest
 import trustme
@@ -130,7 +135,7 @@ class TestHTTPProxyManager(HTTPDummyProxyTestCase):
             conn = hc2._get_conn()
             try:
                 hc2._make_request(conn, "GET", "/")
-                tcp_nodelay_setting = conn.sock.getsockopt(
+                tcp_nodelay_setting = conn.sock.getsockopt(  # type: ignore[attr-defined]
                     socket.IPPROTO_TCP, socket.TCP_NODELAY
                 )
                 assert tcp_nodelay_setting == 0, (
@@ -651,6 +656,93 @@ class TestIPv6HTTPProxyManager(IPv6HTTPDummyProxyTestCase):
 
 
 class TestHTTPSProxyVerification:
+    @staticmethod
+    def _get_proxy_fingerprint_md5(ca_path: str) -> str:
+        proxy_pem_path = pathlib.Path(ca_path).parent / "proxy.pem"
+        proxy_der = ssl.PEM_cert_to_DER_cert(proxy_pem_path.read_text())
+        proxy_hashed = hashlib.md5(proxy_der).digest()
+        fingerprint = binascii.hexlify(proxy_hashed).decode("ascii")
+        return fingerprint
+
+    @staticmethod
+    def _get_certificate_formatted_proxy_host(host: str) -> str:
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            return host
+
+        if addr.version != 6:
+            return host
+
+        # Transform ipv6 like '::1' to 0:0:0:0:0:0:0:1 via '0000:0000:0000:0000:0000:0000:0000:0001'
+        return addr.exploded.replace("0000", "0").replace("000", "")
+
+    def test_https_proxy_assert_fingerprint_md5(
+        self, no_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+    ) -> None:
+        proxy, server = no_san_proxy_with_server
+        proxy_url = f"https://{proxy.host}:{proxy.port}"
+        destination_url = f"https://{server.host}:{server.port}"
+
+        proxy_fingerprint = self._get_proxy_fingerprint_md5(proxy.ca_certs)
+        with proxy_from_url(
+            proxy_url,
+            ca_certs=proxy.ca_certs,
+            proxy_assert_fingerprint=proxy_fingerprint,
+        ) as https:
+            https.request("GET", destination_url)
+
+    def test_https_proxy_assert_fingerprint_md5_non_matching(
+        self, no_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+    ) -> None:
+        proxy, server = no_san_proxy_with_server
+        proxy_url = f"https://{proxy.host}:{proxy.port}"
+        destination_url = f"https://{server.host}:{server.port}"
+
+        proxy_fingerprint = self._get_proxy_fingerprint_md5(proxy.ca_certs)
+        new_char = "b" if proxy_fingerprint[5] == "a" else "a"
+        proxy_fingerprint = proxy_fingerprint[:5] + new_char + proxy_fingerprint[6:]
+
+        with proxy_from_url(
+            proxy_url,
+            ca_certs=proxy.ca_certs,
+            proxy_assert_fingerprint=proxy_fingerprint,
+        ) as https:
+            with pytest.raises(MaxRetryError) as e:
+                https.request("GET", destination_url)
+
+            assert "Fingerprints did not match" in str(e)
+
+    def test_https_proxy_assert_hostname(
+        self, san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+    ) -> None:
+        proxy, server = san_proxy_with_server
+        destination_url = f"https://{server.host}:{server.port}"
+
+        with proxy_from_url(
+            proxy.base_url, ca_certs=proxy.ca_certs, proxy_assert_hostname=proxy.host
+        ) as https:
+            https.request("GET", destination_url)
+
+    def test_https_proxy_assert_hostname_non_matching(
+        self, san_proxy_with_server: tuple[ServerConfig, ServerConfig]
+    ) -> None:
+        proxy, server = san_proxy_with_server
+        destination_url = f"https://{server.host}:{server.port}"
+
+        proxy_hostname = "example.com"
+        with proxy_from_url(
+            proxy.base_url,
+            ca_certs=proxy.ca_certs,
+            proxy_assert_hostname=proxy_hostname,
+        ) as https:
+            with pytest.raises(MaxRetryError) as e:
+                https.request("GET", destination_url)
+
+            proxy_host = self._get_certificate_formatted_proxy_host(proxy.host)
+            msg = f"hostname \\'{proxy_hostname}\\' doesn\\'t match \\'{proxy_host}\\'"
+            assert msg in str(e)
+
     def test_https_proxy_hostname_verification(
         self, no_localhost_san_server: ServerConfig
     ) -> None:
@@ -681,7 +773,7 @@ class TestHTTPSProxyVerification:
             ) or "Hostname mismatch" in str(ssl_error)
 
     def test_https_proxy_ipv4_san(
-        self, ipv4_san_proxy_with_server: Tuple[ServerConfig, ServerConfig]
+        self, ipv4_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
     ) -> None:
         proxy, server = ipv4_san_proxy_with_server
         proxy_url = f"https://{proxy.host}:{proxy.port}"
@@ -691,7 +783,7 @@ class TestHTTPSProxyVerification:
             assert r.status == 200
 
     def test_https_proxy_ipv6_san(
-        self, ipv6_san_proxy_with_server: Tuple[ServerConfig, ServerConfig]
+        self, ipv6_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
     ) -> None:
         proxy, server = ipv6_san_proxy_with_server
         proxy_url = f"https://[{proxy.host}]:{proxy.port}"
@@ -703,7 +795,7 @@ class TestHTTPSProxyVerification:
     @pytest.mark.parametrize("target_scheme", ["http", "https"])
     def test_https_proxy_no_san(
         self,
-        no_san_proxy_with_server: Tuple[ServerConfig, ServerConfig],
+        no_san_proxy_with_server: tuple[ServerConfig, ServerConfig],
         target_scheme: str,
     ) -> None:
         proxy, server = no_san_proxy_with_server
@@ -724,7 +816,7 @@ class TestHTTPSProxyVerification:
             )
 
     def test_https_proxy_no_san_hostname_checks_common_name(
-        self, no_san_proxy_with_server: Tuple[ServerConfig, ServerConfig]
+        self, no_san_proxy_with_server: tuple[ServerConfig, ServerConfig]
     ) -> None:
         proxy, server = no_san_proxy_with_server
         proxy_url = f"https://{proxy.host}:{proxy.port}"
